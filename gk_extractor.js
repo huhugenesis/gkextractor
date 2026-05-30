@@ -9,8 +9,64 @@ ov.innerHTML='<div style="background:#1e1e28;border:2px solid #7c6af0;border-rad
 D.body.appendChild(ov);
 
 function st(x){D.getElementById('_gks').innerHTML=x;}
-function gi(h){var t=D.createElement('div');t.innerHTML=h;var i=t.querySelector('img:not(.emoji):not(.avatar)');if(!i)return null;var s=i.getAttribute('src')||'';return s.startsWith('//')?'https:'+s:s.startsWith('/')?base+s:s||null;}
-function gn(q){var s=(q||'').replace(/<[^>]+>/g,'').replace(/quelle note attribuez.vous [àa]\s*/i,'').replace(/\s*\?$/,'').trim();return s.length>1?s:null;}
+
+// Parse post HTML to build a map: pollName -> {imageUrl, gameName}
+// Structure in cooked HTML: <img> then <div class="poll" data-poll-name="MK8D">
+// The h1/h2 inside the poll div contains the question
+function parsePostHTML(cooked, polls) {
+  var tmp=D.createElement('div');
+  tmp.innerHTML=cooked;
+
+  // Build ordered list of top-level nodes to find image-before-poll pattern
+  var nodes=Array.from(tmp.childNodes);
+  var map={};
+
+  // Also build a flat list of elements in document order
+  var all=Array.from(tmp.querySelectorAll('*'));
+
+  // For each poll div, find the preceding img
+  var pollDivs=Array.from(tmp.querySelectorAll('[data-poll-name]'));
+
+  pollDivs.forEach(function(pollDiv){
+    var pname=pollDiv.getAttribute('data-poll-name');
+
+    // Get game name from the h1 inside the poll div (Discourse renders # as h1)
+    var h=pollDiv.querySelector('h1,h2,h3');
+    var gameName=null;
+    if(h){
+      gameName=h.textContent.replace(/quelle note attribuez.vous [àa]\s*/i,'').replace(/\s*\?$/,'').trim();
+    }
+    // Fallback: check poll question from polls array
+    if(!gameName||gameName.length<2){
+      var po=polls.find(function(p){return p.name===pname;});
+      if(po&&po.question){
+        gameName=(po.question||'').replace(/<[^>]+>/g,'').replace(/quelle note attribuez.vous [àa]\s*/i,'').replace(/\s*\?$/,'').trim();
+      }
+    }
+
+    // Find preceding image: walk backwards in DOM from this poll div
+    var imageUrl=null;
+    var el=pollDiv.previousElementSibling;
+    // Search up to 5 siblings back
+    var tries=0;
+    while(el&&tries<5){
+      var img=el.tagName==='IMG'?el:el.querySelector('img:not(.emoji):not(.avatar)');
+      if(img){
+        var s=img.getAttribute('src')||'';
+        if(s.startsWith('//'))s='https:'+s;
+        else if(s.startsWith('/'))s=base+s;
+        if(s)imageUrl=s;
+        break;
+      }
+      el=el.previousElementSibling;
+      tries++;
+    }
+
+    map[pname]={gameName:gameName||null,imageUrl:imageUrl||null};
+  });
+
+  return map;
+}
 
 async function run(){
   try{
@@ -21,7 +77,7 @@ async function run(){
     var tp=await r.json();
     var posts=tp.post_stream&&tp.post_stream.posts||[];
 
-    // Also fetch posts adjacent to our target post number
+    // Fetch posts adjacent to our target
     var ids=[pni-1,pni,pni+1,pni+2,pni+3];
     var qs=ids.map(function(i){return'post_ids[]='+i;}).join('&');
     var r2=await fetch(base+'/forum/t/'+tid+'/posts.json?'+qs,cred);
@@ -32,16 +88,22 @@ async function run(){
     }
 
     var pwp=posts.filter(function(p){return p.polls&&p.polls.length>0;});
-    if(!pwp.length){st('❌ Aucun sondage trouvé dans ce post.');return;}
-    st(''+pwp.length+' post(s) avec sondages…');
+    if(!pwp.length){st('❌ Aucun sondage trouvé. Vérifie l\'URL.');return;}
+    st(pwp.length+' post(s) avec sondages…');
 
     var res=[];
     for(var pi=0;pi<pwp.length;pi++){
       var p=pwp[pi];
-      var im=gi(p.cooked||'');
+      // Parse HTML to map pollName -> {gameName, imageUrl}
+      var htmlMap=parsePostHTML(p.cooked||'',p.polls);
+
       for(var poi=0;poi<p.polls.length;poi++){
         var po=p.polls[poi];
-        st('Votes: '+po.name+' ('+res.length+'/'+p.polls.length+')…');
+        st('Votes: '+po.name+' ('+( poi+1)+'/'+p.polls.length+')…');
+
+        var info=htmlMap[po.name]||{};
+
+        // Fetch voters per option
         var ov2={};
         for(var oi=0;oi<po.options.length;oi++){
           var o=po.options[oi];
@@ -49,22 +111,40 @@ async function run(){
           if(vr.ok){
             var vd=await vr.json();
             var voters=vd.voters&&vd.voters[o.id]||[];
-            ov2[o.digest]=voters.map(function(v){return{username:v.username,avatarUrl:base+(v.avatar_template||'').replace('{size}','40')};});
+            ov2[o.digest]=voters.map(function(v){
+              return{username:v.username,avatarUrl:base+(v.avatar_template||'').replace('{size}','40')};
+            });
           }
         }
+
         var dist=new Array(10).fill(0),uv={};
         for(var oi2=0;oi2<po.options.length;oi2++){
           var o2=po.options[oi2];
           var n=parseInt((o2.html||o2.text||'').replace(/<[^>]+>/g,'').trim());
           if(n>=1&&n<=10){
             dist[n-1]=o2.votes||0;
-            var vlist=ov2[o2.digest]||[];
-            vlist.forEach(function(v){uv[v.username]={note:n,avatarUrl:v.avatarUrl};});
+            (ov2[o2.digest]||[]).forEach(function(v){uv[v.username]={note:n,avatarUrl:v.avatarUrl};});
           }
         }
         var tot=dist.reduce(function(a,b){return a+b;},0);
         if(!tot)continue;
-        res.push({name:gn(po.question)||'Jeu '+p.id,dist:dist,votes:tot,url:location.href,imageUrl:im,userVotes:uv,serie:''});
+
+        // Game name: from HTML map, then poll.question, then fallback
+        var name=info.gameName;
+        if(!name&&po.question){
+          name=(po.question||'').replace(/<[^>]+>/g,'').replace(/quelle note attribuez.vous [àa]\s*/i,'').replace(/\s*\?$/,'').trim();
+        }
+        if(!name||name.length<2)name=po.name; // use poll short name as last resort
+
+        res.push({
+          name:name,
+          dist:dist,
+          votes:tot,
+          url:location.href,
+          imageUrl:info.imageUrl||null,
+          userVotes:uv,
+          serie:''
+        });
       }
     }
 
@@ -72,7 +152,7 @@ async function run(){
     var j=JSON.stringify(res);
     D.getElementById('_gkt').value=j;
     D.getElementById('_gko').style.display='block';
-    st('✅ <b>'+res.length+' jeu(x)</b> · '+res.filter(function(x){return x.imageUrl;}).length+' image(s)');
+    st('✅ <b>'+res.length+' jeu(x)</b> · '+res.filter(function(x){return x.imageUrl;}).length+' image(s) · '+res.filter(function(x){return x.name!==x.name.toUpperCase();}).length+' noms OK');
     D.getElementById('_gkt').select();
     D.getElementById('_gkb').onclick=function(){
       D.getElementById('_gkt').select();
