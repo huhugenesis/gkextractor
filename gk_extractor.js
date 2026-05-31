@@ -1,6 +1,6 @@
 (function(){
 var base=location.origin,m=location.pathname.match(/\/(\d+)\/(\d+)\/?$/);
-if(!m){alert("GK Extractor: navigue vers un post précis (URL .../topicId/postNumber).");return;}
+if(!m){alert("GK Extractor: navigue vers un post précis.");return;}
 var tid=m[1],pn=m[2],pni=parseInt(pn),D=document;
 var ov=D.createElement('div');
 ov.id='_gkx';
@@ -9,84 +9,48 @@ ov.innerHTML='<div style="background:#1e1e28;border:2px solid #7c6af0;border-rad
 D.body.appendChild(ov);
 function st(x){D.getElementById('_gks').innerHTML=x;}
 
-// Extract game name from poll question text
-// "# Quelle note attribuez-vous à Mario Kart World ?" -> "Mario Kart World"
-function extractName(raw){
-  if(!raw)return null;
-  var s=raw.replace(/<[^>]+>/g,'').trim();
-  // Match everything after "à " or "a " up to optional "?"
-  var r=s.match(/attribuez.vous [àa]\s+(.+?)[\s]*\??\s*$/i);
-  if(r&&r[1]&&r[1].trim().length>1)return r[1].trim();
-  return null;
+function extractName(txt){
+  var s=(txt||'').replace(/\s+/g,' ').trim();
+  var r=s.match(/attribuez.vous\s+[àa]\s+(.+?)\s*\??\s*$/i);
+  return(r&&r[1]&&r[1].trim().length>1)?r[1].trim():null;
 }
 
-// For each poll in a post, find its preceding image in the rendered HTML
-// Structure: <p><img></p> ... <div class="poll" data-poll-name="X"> or <div data-poll-name="X">
-function buildPollMap(cooked, polls){
-  var tmp=D.createElement('div');
-  tmp.innerHTML=cooked;
+function getImgUrl(el){
+  var img=el.querySelector('img:not(.emoji):not(.avatar)');
+  if(!img)return null;
+  var s=img.getAttribute('src')||'';
+  if(s.startsWith('//'))s='https:'+s;
+  else if(s.startsWith('/'))s=base+s;
+  return s||null;
+}
+
+// Parse the LIVE DOM of the current page (not cooked HTML)
+// Finds poll containers and their preceding images directly in the page
+function parseLiveDOM(postNumber){
+  // Find all poll-outer divs in the page
+  var pollDivs=Array.from(D.querySelectorAll('.poll-outer[data-poll-name]'));
   var map={};
 
-  // Log what poll containers look like - try multiple selectors
-  var containers=[];
-  ['[data-poll-name]','div.poll','div[class*="poll"]'].forEach(function(sel){
-    var found=Array.from(tmp.querySelectorAll(sel));
-    found.forEach(function(el){if(!containers.includes(el))containers.push(el);});
-  });
+  pollDivs.forEach(function(pollDiv){
+    var pname=pollDiv.getAttribute('data-poll-name');
 
-  // If no poll containers found in DOM (Discourse may render polls client-side),
-  // fall back to positional matching: images in order correspond to polls in order
-  var imgs=Array.from(tmp.querySelectorAll('img:not(.emoji):not(.avatar):not(.thumbnail)'));
+    // Game name from div.poll-title inside this poll
+    var titleEl=pollDiv.querySelector('.poll-title');
+    var gameName=titleEl?extractName(titleEl.textContent):null;
 
-  if(containers.length===0){
-    // Positional fallback: nth image -> nth poll
-    polls.forEach(function(po,i){
-      var img=imgs[i]||null;
-      var imageUrl=null;
-      if(img){
-        var s=img.getAttribute('src')||'';
-        if(s.startsWith('//'))s='https:'+s;
-        else if(s.startsWith('/'))s=base+s;
-        imageUrl=s||null;
-      }
-      // Game name from poll question (from API)
-      var name=extractName(po.question);
-      map[po.name]={gameName:name,imageUrl:imageUrl};
-    });
-    return map;
-  }
-
-  // Poll containers found: match by data-poll-name and find preceding img
-  containers.forEach(function(pollDiv){
-    var pname=pollDiv.getAttribute('data-poll-name')||'';
-
-    // Game name: look for h1/h2/h3/h4 inside poll div
-    var h=pollDiv.querySelector('h1,h2,h3,h4,strong');
-    var gameName=h?extractName(h.textContent):null;
-
-    // Also try from API poll question
-    if(!gameName){
-      var po=polls.find(function(p){return p.name===pname;});
-      if(po)gameName=extractName(po.question);
-    }
-
-    // Find preceding image (walk back up to 8 siblings)
+    // Find preceding image: walk back through siblings
     var imageUrl=null;
     var el=pollDiv.previousElementSibling;
     var tries=0;
-    while(el&&tries<8){
-      var img=el.tagName==='IMG'?el:el.querySelector('img:not(.emoji):not(.avatar)');
-      if(img){
-        var s=img.getAttribute('src')||'';
-        if(s.startsWith('//'))s='https:'+s;
-        else if(s.startsWith('/'))s=base+s;
-        if(s){imageUrl=s;break;}
-      }
+    while(el&&tries<6){
+      // Discourse wraps images in div.lightbox-wrapper
+      var url=getImgUrl(el);
+      if(url){imageUrl=url;break;}
       el=el.previousElementSibling;
       tries++;
     }
 
-    map[pname]={gameName:gameName||null,imageUrl:imageUrl||null};
+    map[pname]={gameName:gameName,imageUrl:imageUrl};
   });
 
   return map;
@@ -102,26 +66,28 @@ async function run(){
     var posts=tp.post_stream&&tp.post_stream.posts||[];
 
     var ids=[pni-1,pni,pni+1,pni+2,pni+3];
-    var qs=ids.map(function(i){return'post_ids[]='+i;}).join('&');
-    var r2=await fetch(base+'/forum/t/'+tid+'/posts.json?'+qs,cred);
+    var r2=await fetch(base+'/forum/t/'+tid+'/posts.json?'+ids.map(function(i){return'post_ids[]='+i;}).join('&'),cred);
     if(r2.ok){
       var d2=await r2.json();
-      var extra=d2.post_stream&&d2.post_stream.posts||[];
-      extra.forEach(function(p){if(!posts.find(function(x){return x.id===p.id;}))posts.push(p);});
+      (d2.post_stream&&d2.post_stream.posts||[]).forEach(function(p){
+        if(!posts.find(function(x){return x.id===p.id;}))posts.push(p);
+      });
     }
 
     var pwp=posts.filter(function(p){return p.polls&&p.polls.length>0;});
     if(!pwp.length){st('❌ Aucun sondage trouvé.');return;}
 
+    // Use live DOM to get names and images (much more reliable than cooked HTML)
+    var liveMap=parseLiveDOM();
+    st('DOM analysé · '+Object.keys(liveMap).length+' sondage(s) trouvé(s)…');
+
     var res=[];
     for(var pi=0;pi<pwp.length;pi++){
       var p=pwp[pi];
-      var pollMap=buildPollMap(p.cooked||'',p.polls);
-
       for(var poi=0;poi<p.polls.length;poi++){
         var po=p.polls[poi];
-        st('Votes: '+(poi+1)+'/'+p.polls.length+'…');
-        var info=pollMap[po.name]||{};
+        var info=liveMap[po.name]||{};
+        st('Votes: '+(poi+1)+'/'+p.polls.length+' — '+(info.gameName||po.name)+'…');
 
         var ov2={};
         for(var oi=0;oi<po.options.length;oi++){
@@ -148,10 +114,13 @@ async function run(){
         var tot=dist.reduce(function(a,b){return a+b;},0);
         if(!tot)continue;
 
-        // Name: from HTML map first, then API poll question, last resort = poll.name
-        var name=info.gameName||extractName(po.question)||po.name;
-
-        res.push({name:name,dist:dist,votes:tot,url:location.href,imageUrl:info.imageUrl||null,userVotes:uv,serie:''});
+        res.push({
+          name:info.gameName||po.name,
+          dist:dist,votes:tot,
+          url:location.href,
+          imageUrl:info.imageUrl||null,
+          userVotes:uv,serie:''
+        });
       }
     }
 
@@ -160,8 +129,8 @@ async function run(){
     D.getElementById('_gkt').value=j;
     D.getElementById('_gko').style.display='block';
     var imgOk=res.filter(function(x){return x.imageUrl;}).length;
-    var nameOk=res.filter(function(x){return x.name!==x.name.toUpperCase()&&x.name.indexOf(' ')>0;}).length;
-    st('✅ <b>'+res.length+' jeu(x)</b> · '+imgOk+' image(s) · '+nameOk+' nom(s) complet(s)');
+    var nameOk=res.filter(function(x){return x.name&&x.name.indexOf(' ')>0;}).length;
+    st('✅ <b>'+res.length+' jeu(x)</b> · '+imgOk+' image(s) · '+nameOk+'/'+res.length+' noms complets');
     D.getElementById('_gkt').select();
     D.getElementById('_gkb').onclick=function(){
       D.getElementById('_gkt').select();
