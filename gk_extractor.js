@@ -2,6 +2,8 @@
 var base=location.origin,m=location.pathname.match(/\/(\d+)\/(\d+)\/?$/);
 if(!m){alert("GK Extractor: navigue vers un post précis.");return;}
 var tid=m[1],pn=m[2],pni=parseInt(pn),D=document;
+
+// Build UI
 var ov=D.createElement('div');
 ov.id='_gkx';
 ov.style.cssText='position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;font-family:system-ui';
@@ -15,52 +17,21 @@ function extractName(txt){
   return(r&&r[1]&&r[1].trim().length>1)?r[1].trim():null;
 }
 
-// Gentle single scroll to bottom then back, to trigger lazy loading
-function gentleScroll(){
-  return new Promise(function(resolve){
-    st('Chargement des sondages…');
-    var total=D.body.scrollHeight;
-    var step=Math.ceil(total/10);
-    var pos=0;
-    var count=0;
-    function next(){
-      pos+=step;
-      window.scrollTo(0,pos);
-      count++;
-      if(count>=10||pos>=total){
-        window.scrollTo(0,0);
-        setTimeout(resolve,500);
-      } else {
-        setTimeout(next,150);
-      }
-    }
-    next();
-  });
-}
-
-// Read voter avatars from live DOM
-// Discourse shows voters per option in .results li elements
+// Read voters from live DOM - no API calls for this
 function readDOMVoters(){
   var map={};
-  var pollDivs=Array.from(D.querySelectorAll('.poll-outer[data-poll-name]'));
-  pollDivs.forEach(function(pd){
+  D.querySelectorAll('.poll-outer[data-poll-name]').forEach(function(pd){
     var pname=pd.getAttribute('data-poll-name');
     var uv={};
-    // Each result row: contains the option number and voter avatars
-    var rows=Array.from(pd.querySelectorAll('.results li, ul.results > li'));
-    rows.forEach(function(li){
-      // Option text = the note (1-10)
-      var optEl=li.querySelector('.option span, .answer');
-      var txt=optEl?optEl.textContent:li.childNodes[0]?li.childNodes[0].textContent:'';
+    // Each result row contains note + voter avatars
+    pd.querySelectorAll('.results li, ul.results > li').forEach(function(li){
+      var txt=(li.querySelector('.option span, .answer, span.percentage')||{}).textContent||
+               (li.childNodes[0]?li.childNodes[0].textContent:'');
       var note=parseInt((txt||'').trim());
       if(isNaN(note)||note<1||note>10)return;
-      // Avatars of voters for this note
-      var imgs=Array.from(li.querySelectorAll('img[src*="user_avatar"], img[src*="avatar_template"], img.avatar'));
-      imgs.forEach(function(img){
-        var username=(img.getAttribute('alt')||img.getAttribute('title')||'').replace(/^@/,'').trim();
-        if(username&&!uv[username]){
-          uv[username]={note:note,avatarUrl:img.src||''};
-        }
+      li.querySelectorAll('img[src*="user_avatar"], img[src*="avatar_template"], img.avatar').forEach(function(img){
+        var u=(img.getAttribute('alt')||img.getAttribute('title')||'').replace(/^@/,'').trim();
+        if(u&&!uv[u])uv[u]={note:note,avatarUrl:img.src||''};
       });
     });
     map[pname]=uv;
@@ -68,7 +39,7 @@ function readDOMVoters(){
   return map;
 }
 
-// Parse live DOM for game name and image
+// Parse live DOM for name + image
 function parseLiveDOM(){
   var map={};
   D.querySelectorAll('.poll-outer[data-poll-name]').forEach(function(pd){
@@ -96,28 +67,26 @@ function parseLiveDOM(){
 
 async function run(){
   try{
-    // 1. Gentle scroll to load all polls
-    await gentleScroll();
-
+    // NO auto-scroll - user should scroll manually before clicking
     var pollCount=D.querySelectorAll('.poll-outer[data-poll-name]').length;
-    st(pollCount+' sondage(s) détecté(s)…');
-    if(!pollCount){st('❌ Aucun sondage visible. Assure-toi d\'être sur le bon post.');return;}
+    if(!pollCount){
+      st('⚠️ Aucun sondage visible. Scrolle jusqu\'aux sondages puis relance.');
+      return;
+    }
+    st(pollCount+' sondage(s) détecté(s) — lecture du DOM…');
 
-    // 2. Read voters and metadata from live DOM
     var domVoters=readDOMVoters();
     var liveMap=parseLiveDOM();
-
     var domTotal=Object.values(domVoters).reduce(function(t,uv){return t+Object.keys(uv).length;},0);
-    st('DOM: '+domTotal+' vote(s) lus — récupération API…');
+    st('DOM: '+domTotal+' vote(s) — appel API…');
 
-    // 3. One single API call for the topic JSON (no per-option loops)
+    // Only 2 API calls total
     var cred={credentials:'include'};
     var r=await fetch(base+'/forum/t/'+tid+'/'+pn+'.json',cred);
-    if(!r.ok)throw new Error('HTTP '+r.status+' — connecté ?');
+    if(!r.ok)throw new Error('HTTP '+r.status+(r.status===429?' — rate limit, attends quelques minutes':' — connecté ?'));
     var tp=await r.json();
     var posts=tp.post_stream&&tp.post_stream.posts||[];
 
-    // One extra call for adjacent posts
     var ids=[pni-1,pni,pni+1,pni+2,pni+3];
     var r2=await fetch(base+'/forum/t/'+tid+'/posts.json?'+ids.map(function(i){return'post_ids[]='+i;}).join('&'),cred);
     if(r2.ok){
@@ -131,18 +100,14 @@ async function run(){
     if(!pwp.length){st('❌ Aucun sondage dans l\'API.');return;}
 
     var res=[];
-    for(var pi=0;pi<pwp.length;pi++){
-      var p=pwp[pi];
-      for(var poi=0;poi<p.polls.length;poi++){
-        var po=p.polls[poi];
-        var info=liveMap[po.name]||{};
-        var total2=pwp.reduce(function(t,x){return t+x.polls.length;},0);
-        st((res.length+1)+'/'+total2+' — '+(info.gameName||po.name)+'…');
+    var totalPolls=pwp.reduce(function(t,x){return t+x.polls.length;},0);
 
-        // Merge voters: DOM first (has real notes), then preloaded_voters as supplement
+    pwp.forEach(function(p){
+      p.polls.forEach(function(po){
+        var info=liveMap[po.name]||{};
         var uv=Object.assign({},domVoters[po.name]||{});
 
-        // Supplement with preloaded_voters from API payload
+        // Supplement with preloaded_voters (no extra API calls)
         if(po.preloaded_voters){
           Object.keys(po.preloaded_voters).forEach(function(optId){
             var opt=po.options.find(function(o){return o.id===optId;});
@@ -150,40 +115,31 @@ async function run(){
             var n=parseInt((opt.html||opt.text||'').replace(/<[^>]+>/g,'').trim());
             if(n<1||n>10)return;
             (po.preloaded_voters[optId]||[]).forEach(function(v){
-              if(!uv[v.username]){
+              if(!uv[v.username])
                 uv[v.username]={note:n,avatarUrl:base+(v.avatar_template||'').replace('{size}','40')};
-              }
             });
           });
         }
 
-        // Build distribution from API options (authoritative counts)
         var dist=new Array(10).fill(0);
         po.options.forEach(function(o){
           var n=parseInt((o.html||o.text||'').replace(/<[^>]+>/g,'').trim());
           if(n>=1&&n<=10)dist[n-1]=o.votes||0;
         });
         var tot=dist.reduce(function(a,b){return a+b;},0);
-        if(!tot)continue;
+        if(!tot)return;
 
-        res.push({
-          name:info.gameName||po.name,
-          dist:dist,votes:tot,
-          url:location.href,
-          imageUrl:info.imageUrl||null,
-          userVotes:uv,
-          serie:''
-        });
-      }
-    }
+        res.push({name:info.gameName||po.name,dist:dist,votes:tot,
+          url:location.href,imageUrl:info.imageUrl||null,userVotes:uv,serie:''});
+      });
+    });
 
     if(!res.length){st('❌ Aucune donnée.');return;}
     var j=JSON.stringify(res);
     D.getElementById('_gkt').value=j;
     D.getElementById('_gko').style.display='block';
-    var imgOk=res.filter(function(x){return x.imageUrl;}).length;
     var uvTotal=res.reduce(function(t,x){return t+Object.keys(x.userVotes).length;},0);
-    st('✅ <b>'+res.length+' jeu(x)</b> · '+imgOk+' image(s) · '+uvTotal+' votes individuels');
+    st('✅ <b>'+res.length+' jeu(x)</b> · '+res.filter(function(x){return x.imageUrl;}).length+' image(s) · '+uvTotal+' votes individuels');
     D.getElementById('_gkt').select();
     D.getElementById('_gkb').onclick=function(){
       D.getElementById('_gkt').select();
