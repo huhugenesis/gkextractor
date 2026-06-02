@@ -2,8 +2,6 @@
 var base=location.origin,m=location.pathname.match(/\/(\d+)\/(\d+)\/?$/);
 if(!m){alert("GK Extractor: navigue vers un post précis.");return;}
 var tid=m[1],pn=m[2],pni=parseInt(pn),D=document;
-
-// Build UI
 var ov=D.createElement('div');
 ov.id='_gkx';
 ov.style.cssText='position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;font-family:system-ui';
@@ -17,73 +15,79 @@ function extractName(txt){
   return(r&&r[1]&&r[1].trim().length>1)?r[1].trim():null;
 }
 
-// Read voters from live DOM - no API calls for this
-function readDOMVoters(){
-  var map={};
-  D.querySelectorAll('.poll-outer[data-poll-name]').forEach(function(pd){
-    var pname=pd.getAttribute('data-poll-name');
+// Read all polls from live DOM using correct selectors
+// Structure: div.poll > div.poll-container > div.poll-title
+//                                          > div.discourse-poll-regular-results
+//                                            > ul.results > li > div.option
+//                                              > p > span.option-text (note)
+//                                              > div.poll-voters > ul.poll-voters-list
+//                                                > li > a[data-user-card]
+function readFromDOM(){
+  var polls=[];
+  // Find all poll containers in page order
+  D.querySelectorAll('div.poll').forEach(function(pollDiv){
+    var titleEl=pollDiv.querySelector('.poll-title');
+    var gameName=titleEl?extractName(titleEl.textContent):null;
+
+    // Find preceding image (for vignette)
+    var imageUrl=null;
+    var el=pollDiv.parentElement?pollDiv.parentElement.previousElementSibling:null;
+    // Walk up to find lightbox-wrapper sibling
+    var container=pollDiv.closest('li,article,.cooked')||pollDiv.parentElement;
+    if(container){
+      var sib=pollDiv.previousElementSibling;
+      var tries=0;
+      while(sib&&tries<8){
+        var img=sib.querySelector?sib.querySelector('img:not(.avatar):not(.emoji)'):null;
+        if(!img&&sib.tagName==='IMG'&&!sib.classList.contains('avatar'))img=sib;
+        if(img){
+          var s=img.getAttribute('src')||'';
+          if(s.startsWith('//'))s='https:'+s;
+          else if(s.startsWith('/'))s=base+s;
+          if(s&&!s.includes('avatar')&&!s.includes('emoji')){imageUrl=s;break;}
+        }
+        sib=sib.previousElementSibling;tries++;
+      }
+    }
+
+    // Read voter per option
     var uv={};
-    // Each result row contains note + voter avatars
-    pd.querySelectorAll('.results li, ul.results > li').forEach(function(li){
-      var txt=(li.querySelector('.option span, .answer, span.percentage')||{}).textContent||
-               (li.childNodes[0]?li.childNodes[0].textContent:'');
-      var note=parseInt((txt||'').trim());
+    pollDiv.querySelectorAll('ul.results > li').forEach(function(li){
+      var noteEl=li.querySelector('.option-text');
+      if(!noteEl)return;
+      var note=parseInt(noteEl.textContent.trim());
       if(isNaN(note)||note<1||note>10)return;
-      li.querySelectorAll('img[src*="user_avatar"], img[src*="avatar_template"], img.avatar').forEach(function(img){
-        var u=(img.getAttribute('alt')||img.getAttribute('title')||'').replace(/^@/,'').trim();
-        if(u&&!uv[u])uv[u]={note:note,avatarUrl:img.src||''};
+      // Use data-user-card attribute — most reliable source for username
+      li.querySelectorAll('a[data-user-card]').forEach(function(a){
+        var username=a.getAttribute('data-user-card')||'';
+        username=username.trim();
+        if(!username)return;
+        var img=a.querySelector('img');
+        var avatarUrl=img?img.getAttribute('src'):'';
+        if(!uv[username])uv[username]={note:note,avatarUrl:avatarUrl||''};
       });
     });
-    map[pname]=uv;
-  });
-  return map;
-}
 
-// Parse live DOM for name + image
-function parseLiveDOM(){
-  var map={};
-  D.querySelectorAll('.poll-outer[data-poll-name]').forEach(function(pd){
-    var pname=pd.getAttribute('data-poll-name');
-    var titleEl=pd.querySelector('.poll-title');
-    var gameName=titleEl?extractName(titleEl.textContent):null;
-    var imageUrl=null;
-    var el=pd.previousElementSibling;
-    var tries=0;
-    while(el&&tries<6){
-      var img=el.querySelector?el.querySelector('img:not(.emoji):not(.avatar)'):null;
-      if(!img&&el.tagName==='IMG')img=el;
-      if(img){
-        var s=img.getAttribute('src')||'';
-        if(s.startsWith('//'))s='https:'+s;
-        else if(s.startsWith('/'))s=base+s;
-        if(s){imageUrl=s;break;}
-      }
-      el=el.previousElementSibling;tries++;
-    }
-    map[pname]={gameName:gameName,imageUrl:imageUrl};
+    polls.push({gameName:gameName,imageUrl:imageUrl,userVotes:uv,
+      voterCount:Object.keys(uv).length});
   });
-  return map;
+  return polls;
 }
 
 async function run(){
   try{
-    // NO auto-scroll - user should scroll manually before clicking
-    var pollCount=D.querySelectorAll('.poll-outer[data-poll-name]').length;
-    if(!pollCount){
-      st('⚠️ Aucun sondage visible. Scrolle jusqu\'aux sondages puis relance.');
+    var domPolls=readFromDOM();
+    if(!domPolls.length){
+      st('⚠️ Aucun sondage visible (div.poll introuvable).<br>Assure-toi que les sondages sont affichés sur la page.');
       return;
     }
-    st(pollCount+' sondage(s) détecté(s) — lecture du DOM…');
+    var domTotal=domPolls.reduce(function(t,p){return t+p.voterCount;},0);
+    st(domPolls.length+' sondage(s) · '+domTotal+' votants lus — appel API…');
 
-    var domVoters=readDOMVoters();
-    var liveMap=parseLiveDOM();
-    var domTotal=Object.values(domVoters).reduce(function(t,uv){return t+Object.keys(uv).length;},0);
-    st('DOM: '+domTotal+' vote(s) — appel API…');
-
-    // Only 2 API calls total
+    // 2 API calls only
     var cred={credentials:'include'};
     var r=await fetch(base+'/forum/t/'+tid+'/'+pn+'.json',cred);
-    if(!r.ok)throw new Error('HTTP '+r.status+(r.status===429?' — rate limit, attends quelques minutes':' — connecté ?'));
+    if(!r.ok)throw new Error('HTTP '+r.status+(r.status===429?' — rate limit actif, attends quelques minutes':''));
     var tp=await r.json();
     var posts=tp.post_stream&&tp.post_stream.posts||[];
 
@@ -99,39 +103,47 @@ async function run(){
     var pwp=posts.filter(function(p){return p.polls&&p.polls.length>0;});
     if(!pwp.length){st('❌ Aucun sondage dans l\'API.');return;}
 
-    var res=[];
-    var totalPolls=pwp.reduce(function(t,x){return t+x.polls.length;},0);
-
+    // Flatten all polls from API in order
+    var apiPolls=[];
     pwp.forEach(function(p){
-      p.polls.forEach(function(po){
-        var info=liveMap[po.name]||{};
-        var uv=Object.assign({},domVoters[po.name]||{});
+      p.polls.forEach(function(po){apiPolls.push({post:p,poll:po});});
+    });
 
-        // Supplement with preloaded_voters (no extra API calls)
-        if(po.preloaded_voters){
-          Object.keys(po.preloaded_voters).forEach(function(optId){
-            var opt=po.options.find(function(o){return o.id===optId;});
-            if(!opt)return;
-            var n=parseInt((opt.html||opt.text||'').replace(/<[^>]+>/g,'').trim());
-            if(n<1||n>10)return;
-            (po.preloaded_voters[optId]||[]).forEach(function(v){
-              if(!uv[v.username])
-                uv[v.username]={note:n,avatarUrl:base+(v.avatar_template||'').replace('{size}','40')};
-            });
+    // Match DOM polls to API polls by position
+    var res=[];
+    apiPolls.forEach(function(ap,i){
+      var po=ap.poll,p=ap.post;
+      var domData=domPolls[i]||{userVotes:{},gameName:null,imageUrl:null};
+
+      // Merge: DOM voters (real notes) + preloaded_voters supplement
+      var uv=Object.assign({},domData.userVotes);
+      if(po.preloaded_voters){
+        Object.keys(po.preloaded_voters).forEach(function(optId){
+          var opt=po.options.find(function(o){return o.id===optId;});
+          if(!opt)return;
+          var n=parseInt((opt.html||opt.text||'').replace(/<[^>]+>/g,'').trim());
+          if(n<1||n>10)return;
+          (po.preloaded_voters[optId]||[]).forEach(function(v){
+            if(!uv[v.username])
+              uv[v.username]={note:n,avatarUrl:base+(v.avatar_template||'').replace('{size}','40')};
           });
-        }
-
-        var dist=new Array(10).fill(0);
-        po.options.forEach(function(o){
-          var n=parseInt((o.html||o.text||'').replace(/<[^>]+>/g,'').trim());
-          if(n>=1&&n<=10)dist[n-1]=o.votes||0;
         });
-        var tot=dist.reduce(function(a,b){return a+b;},0);
-        if(!tot)return;
+      }
 
-        res.push({name:info.gameName||po.name,dist:dist,votes:tot,
-          url:location.href,imageUrl:info.imageUrl||null,userVotes:uv,serie:''});
+      // Distribution from API (authoritative)
+      var dist=new Array(10).fill(0);
+      po.options.forEach(function(o){
+        var n=parseInt((o.html||o.text||'').replace(/<[^>]+>/g,'').trim());
+        if(n>=1&&n<=10)dist[n-1]=o.votes||0;
       });
+      var tot=dist.reduce(function(a,b){return a+b;},0);
+      if(!tot)return;
+
+      // Name: from DOM title, then API poll question, then short name
+      var name=domData.gameName||extractName(po.question)||po.name;
+
+      res.push({name:name,dist:dist,votes:tot,url:location.href,
+        imageUrl:domData.imageUrl||null,userVotes:uv,serie:''});
     });
 
     if(!res.length){st('❌ Aucune donnée.');return;}
@@ -139,7 +151,8 @@ async function run(){
     D.getElementById('_gkt').value=j;
     D.getElementById('_gko').style.display='block';
     var uvTotal=res.reduce(function(t,x){return t+Object.keys(x.userVotes).length;},0);
-    st('✅ <b>'+res.length+' jeu(x)</b> · '+res.filter(function(x){return x.imageUrl;}).length+' image(s) · '+uvTotal+' votes individuels');
+    var imgOk=res.filter(function(x){return x.imageUrl;}).length;
+    st('✅ <b>'+res.length+' jeu(x)</b> · '+imgOk+' image(s) · '+uvTotal+' votes individuels');
     D.getElementById('_gkt').select();
     D.getElementById('_gkb').onclick=function(){
       D.getElementById('_gkt').select();
